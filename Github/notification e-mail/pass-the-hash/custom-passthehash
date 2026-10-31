@@ -1,0 +1,365 @@
+#!/bin/bash
+# =============================================================================
+# Script d'intégration Wazuh — Notification Email Pass the Hash
+# Chemin    : /var/ossec/integrations/custom-pth
+# VERSION CORRIGÉE : verrou anti-doublon par LogonID (plus de blocage entre tests)
+# =============================================================================
+
+ALERT_FILE=$1
+LOG_FILE="/var/ossec/logs/integrations.log"
+TEMPLATE="/var/ossec/integrations/passthehash.html"
+TMP_HTML="/tmp/pth_alert_$$.html"
+TMP_MIME="/tmp/pth_mime_$$.eml"
+EMAIL_TO="benalisafia99@gmail.com"
+RULE_ID="100901"
+
+LOGO_DIR="/var/ossec/integrations/logos"
+WAZUH_LOGO="${LOGO_DIR}/wazuh.png"
+AD_LOGO="${LOGO_DIR}/AD.png"
+MEDI1_LOGO="${LOGO_DIR}/Meditv.jpg"
+
+# Identifiants LDAP centralisés (voir /var/ossec/integrations/.ldap_creds)
+LDAP_CREDS_FILE="/var/ossec/integrations/.ldap_creds"
+LDAP_HOST="ldap://192.168.56.30"
+LDAP_BASE="DC=gstr,DC=local"
+
+BOUNDARY="WAZUH_MIME_BOUNDARY_$$"
+KERBERO_LOCK="/tmp/kerberoasting_email_lock"
+DCSYNC_LOCK="/tmp/dcsync_email_lock"
+LOCK_TIMEOUT=120
+
+# Fenêtre d'attente pour voir si un DCSync suit ce PtH (même session)
+CORRELATION_WINDOW=35
+
+# =============================================================================
+# FONCTIONS
+# =============================================================================
+
+log() {
+    echo "$(date '+%Y/%m/%d %H:%M:%S') custom-passthehash: $1" >> "${LOG_FILE}"
+}
+
+extract() {
+    local FIELD=$1
+    python3 -c "
+import json, sys
+try:
+    d = json.loads(open('${ALERT_FILE}', encoding='utf-8', errors='replace').read())
+    keys = '${FIELD}'.split('.')
+    val = d
+    for k in keys:
+        val = val.get(k, {}) if isinstance(val, dict) else {}
+    print(val if val not in [{}, None, ''] else 'N/A')
+except Exception as e:
+    print('N/A')
+"
+}
+
+# Échappe les caractères spéciaux LDAP (RFC 4515) avant insertion dans un filtre
+ldap_escape() {
+    local s="$1"
+    s="${s//\\/\\5c}"
+    s="${s//\*/\\2a}"
+    s="${s//(/\\28}"
+    s="${s//)/\\29}"
+    s="${s//$'\x00'/\\00}"
+    echo "$s"
+}
+
+build_image_part() {
+    local FILE=$1
+    local CID=$2
+    local FILENAME
+    FILENAME=$(basename "$FILE")
+    local EXT="${FILENAME##*.}"
+    local MIME_TYPE="image/png"
+    case "${EXT,,}" in
+        jpg|jpeg) MIME_TYPE="image/jpeg" ;;
+        png)      MIME_TYPE="image/png"  ;;
+    esac
+    {
+        echo "--${BOUNDARY}"
+        echo "Content-Type: ${MIME_TYPE}"
+        echo "Content-Transfer-Encoding: base64"
+        echo "Content-ID: <${CID}>"
+        echo "Content-Disposition: inline"
+        echo ""
+        base64 "$FILE"
+        echo ""
+    } >> "$TMP_MIME"
+}
+
+# =============================================================================
+# DEBUT DU SCRIPT
+# =============================================================================
+
+log "Script demarre, fichier: ${ALERT_FILE}"
+[ ! -f "$ALERT_FILE" ] && { log "ERREUR: fichier introuvable"; exit 1; }
+
+# Chargement des identifiants LDAP depuis un fichier séparé (chmod 600 root:wazuh)
+if [ -f "$LDAP_CREDS_FILE" ]; then
+    source "$LDAP_CREDS_FILE"
+else
+    log "ERREUR: fichier d'identifiants LDAP introuvable (${LDAP_CREDS_FILE})"
+    exit 1
+fi
+
+ALERT_RULE_ID=$(python3 -c "
+import json
+try:
+    d = json.loads(open('${ALERT_FILE}', encoding='utf-8', errors='replace').read())
+    print(str(d.get('rule', {}).get('id', '')))
+except:
+    print('')
+")
+
+log "Regle detectee: ${ALERT_RULE_ID}"
+
+if [ "$ALERT_RULE_ID" != "$RULE_ID" ]; then
+    log "Ignore: regle ${ALERT_RULE_ID} differente de ${RULE_ID}"
+    exit 0
+fi
+
+# =============================================================================
+# FILTRES RAPIDES (avant l'attente de corrélation)
+# =============================================================================
+
+IP_RAW=$(extract "data.win.eventdata.ipAddress")
+IP_ADDRESS=$(echo "$IP_RAW" | sed 's/::ffff://')
+TARGET_USER=$(extract "data.win.eventdata.targetUserName")
+LOGON_ID=$(extract "data.win.eventdata.targetLogonId")
+
+# Verrou anti-doublon par LogonID (chaque attaque a un LogonID unique)
+LOCK_FILE="/tmp/pth_email_lock_${LOGON_ID}"
+
+# 1. Ignorer si IP absente (evil-winrm)
+if [ "$IP_ADDRESS" = "N/A" ]; then
+    log "Ignore: IP source absente (evil-winrm) — pas d'email"
+    exit 0
+fi
+
+# 2. Ignorer ANONYMOUS LOGON
+if [ "$TARGET_USER" = "ANONYMOUS LOGON" ]; then
+    log "Ignore: ANONYMOUS LOGON — faux positif impacket"
+    exit 0
+fi
+
+# 3. Ignorer si Kerberoasting récent (< LOCK_TIMEOUT s)
+if [ -f "$KERBERO_LOCK" ]; then
+    KERBERO_AGE=$(( $(date +%s) - $(stat -c %Y "$KERBERO_LOCK") ))
+    if [ "$KERBERO_AGE" -lt "$LOCK_TIMEOUT" ]; then
+        log "Ignore: faux positif PTH — Kerberoasting detecte il y a ${KERBERO_AGE}s"
+        exit 0
+    fi
+fi
+
+# 4. Anti-doublon PTH par LogonID (même session = même attaque)
+if [ -f "$LOCK_FILE" ]; then
+    log "Email supprime — doublon PtH detecte pour session ${LOGON_ID}"
+    exit 0
+fi
+touch "$LOCK_FILE"
+
+# =============================================================================
+# CORRELATION DCSync — ATTENTE avant decision
+#
+# Le 4624 (PtH) arrive TOUJOURS avant le 4662 (DCSync) dans une attaque
+# DCSync reelle. On attend donc quelques secondes pour laisser le temps
+# a custom-dcsyn d'ecrire ses marqueurs (/tmp/dcsync_user, /tmp/dcsync_logonid)
+# avant de decider si ce PtH doit etre notifie separement ou absorbe.
+# =============================================================================
+
+PTH_DETECTION_TS=$(date +%s)
+log "PtH detecte (LogonID=${LOGON_ID}, User=${TARGET_USER}) — attente ${CORRELATION_WINDOW}s pour verifier un DCSync correlé"
+sleep "$CORRELATION_WINDOW"
+
+DCSYNC_LOGONID=$(cat /tmp/dcsync_logonid 2>/dev/null)
+DCSYNC_USER=$(cat /tmp/dcsync_user 2>/dev/null)
+
+DCSYNC_MARKER_TS=0
+if [ -f /tmp/dcsync_logonid ]; then
+    DCSYNC_MARKER_TS=$(stat -c %Y /tmp/dcsync_logonid)
+fi
+
+if [ "$DCSYNC_MARKER_TS" -ge "$PTH_DETECTION_TS" ] && [ -n "$DCSYNC_LOGONID" ] && [ "$LOGON_ID" = "$DCSYNC_LOGONID" ]; then
+    log "Ignore: DCSync confirme (post-PtH) pour le meme Logon ID (${LOGON_ID}) — PtH etait l'etape preliminaire, email DCSync prioritaire"
+    exit 0
+elif [ "$DCSYNC_MARKER_TS" -ge "$PTH_DETECTION_TS" ] && [ -n "$DCSYNC_USER" ] && [ "$TARGET_USER" = "$DCSYNC_USER" ]; then
+    log "Ignore: DCSync confirme (post-PtH) pour le meme compte (${DCSYNC_USER}) — faux positif probable (fallback compte)"
+    exit 0
+else
+    log "Aucun marqueur DCSync ecrit depuis le debut de ce PtH (marker_ts=${DCSYNC_MARKER_TS}, pth_ts=${PTH_DETECTION_TS}) — PtH considere comme isole, envoi de l'email"
+fi
+
+# =============================================================================
+# EXTRACTION DES CHAMPS RESTANTS
+# =============================================================================
+
+# Après — conversion UTC → UTC+1 (Africa/Casablanca)
+TIMESTAMP_RAW=$(extract "timestamp")
+
+TIMESTAMP=$(python3 -c "
+import re
+from datetime import datetime, timezone, timedelta
+
+try:
+    ts = '${TIMESTAMP_RAW}'
+    ts = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts.replace('Z', '+00:00'))
+    dt = datetime.fromisoformat(ts)
+
+    local = dt.astimezone(timezone(timedelta(hours=1)))
+
+    print(local.strftime('%Y-%m-%d %H:%M:%S'))
+except Exception as e:
+    print('${TIMESTAMP_RAW}')
+")
+
+RULE_LEVEL=$(extract "rule.level")
+EVENT_ID=$(extract "data.win.system.eventID")
+COMPUTER=$(extract "data.win.system.computer")
+RECORD_ID=$(extract "data.win.system.eventRecordID")
+AUTH_PACKAGE=$(extract "data.win.eventdata.authenticationPackageName")
+LOGON_TYPE=$(extract "data.win.eventdata.logonType")
+WORKSTATION=$(extract "data.win.eventdata.workstationName")
+DOMAIN="GSTR.LOCAL"
+
+SAFE_TARGET_USER=$(ldap_escape "$TARGET_USER")
+
+# Enrichissement machine source
+if [ "$WORKSTATION" = "N/A" ]; then
+    WORKSTATION=$(python3 -c "
+import socket
+try:
+    name = socket.gethostbyaddr('${IP_ADDRESS}')[0]
+    print(name)
+except:
+    print('')
+")
+    if [ -z "$WORKSTATION" ]; then
+        WORKSTATION=$(ldapsearch \
+            -x -LLL -o ldif-wrap=no \
+            -H "$LDAP_HOST" \
+            -D "$LDAP_BIND_DN" \
+            -w "$LDAP_BIND_PW" \
+            -b "$LDAP_BASE" \
+            "(objectClass=computer)" \
+            dNSHostName 2>/dev/null | grep "${IP_ADDRESS}" | head -1 | cut -d' ' -f2-)
+    fi
+    [ -z "$WORKSTATION" ] && WORKSTATION="Machine externe (non membre du domaine)"
+fi
+
+log "Alerte Pass the Hash: ${TARGET_USER}@${DOMAIN} depuis ${IP_ADDRESS}"
+
+# =============================================================================
+# ENRICHISSEMENT LDAP
+# =============================================================================
+
+LDAP_RESULT=$(ldapsearch \
+    -x -LLL -o ldif-wrap=no \
+    -H "$LDAP_HOST" \
+    -D "$LDAP_BIND_DN" \
+    -w "$LDAP_BIND_PW" \
+    -b "$LDAP_BASE" \
+    "(sAMAccountName=${SAFE_TARGET_USER})" \
+    memberOf 2>>"$LOG_FILE")
+
+[ -z "$LDAP_RESULT" ] && log "ATTENTION: ldapsearch vide pour ${TARGET_USER}"
+
+MEMBER_OF=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^memberOf::\ (.+) ]]; then
+        VAL=$(echo "${BASH_REMATCH[1]}" | tr -d ' ' | base64 -d 2>/dev/null)
+    elif [[ "$line" =~ ^memberOf:\ (.+) ]]; then
+        VAL="${BASH_REMATCH[1]}"
+    else
+        continue
+    fi
+    [ -n "$MEMBER_OF" ] && MEMBER_OF="${MEMBER_OF} | "
+    MEMBER_OF="${MEMBER_OF}${VAL}"
+done <<< "$LDAP_RESULT"
+[ -z "$MEMBER_OF" ] && MEMBER_OF="Aucun groupe secondaire"
+
+# =============================================================================
+# GÉNÉRATION DU HTML
+# =============================================================================
+
+[ ! -f "$TEMPLATE" ] && { log "ERREUR: template introuvable ${TEMPLATE}"; exit 1; }
+for LOGO in "$WAZUH_LOGO" "$AD_LOGO" "$MEDI1_LOGO"; do
+    [ ! -f "$LOGO" ] && { log "ERREUR: logo introuvable ${LOGO}"; exit 1; }
+done
+
+python3 << PYEOF
+with open("${TEMPLATE}", "r", encoding="utf-8") as f:
+    html = f.read()
+
+member_of_raw = """${MEMBER_OF}"""
+groups = member_of_raw.split(" | ")
+member_of_formatted = "<br>".join(
+    "• " + g.split(",")[0].replace("CN=", "").strip()
+    for g in groups if g.strip()
+)
+
+replacements = {
+    "{{TIMESTAMP}}"    : """${TIMESTAMP}""",
+    "{{EVENT_ID}}"     : """${EVENT_ID}""",
+    "{{COMPUTER}}"     : """${COMPUTER}""",
+    "{{DOMAIN}}"       : """${DOMAIN}""",
+    "{{TARGET_USER}}"  : """${TARGET_USER}""",
+    "{{AUTH_PACKAGE}}" : """${AUTH_PACKAGE}""",
+    "{{LOGON_TYPE}}"   : """${LOGON_TYPE}""",
+    "{{LOGON_ID}}"     : """${LOGON_ID}""",
+    "{{IP_ADDRESS}}"   : """${IP_ADDRESS}""",
+    "{{WORKSTATION}}"  : """${WORKSTATION}""",
+    "{{MEMBER_OF}}"    : member_of_formatted,
+    "{{RULE_ID}}"      : """${ALERT_RULE_ID}""",
+    "{{RULE_LEVEL}}"   : """${RULE_LEVEL}""",
+    "{{RECORD_ID}}"    : """${RECORD_ID}""",
+}
+
+for key, val in replacements.items():
+    html = html.replace(key, val)
+
+with open("${TMP_HTML}", "w", encoding="utf-8") as f:
+    f.write(html)
+PYEOF
+
+if [ $? -ne 0 ]; then
+    log "ERREUR: generation HTML echouee"
+    exit 1
+fi
+
+# =============================================================================
+# CONSTRUCTION MIME ET ENVOI
+# =============================================================================
+
+{
+    echo "From: wazuh@gstr.local"
+    echo "To: ${EMAIL_TO}"
+    echo "Subject: [Wazuh] Pass the Hash Detecte - ${TARGET_USER}@${DOMAIN} depuis ${IP_ADDRESS}"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: multipart/related; type=\"text/html\"; boundary=\"${BOUNDARY}\""
+    echo ""
+    echo "--${BOUNDARY}"
+    echo "Content-Type: text/html; charset=UTF-8"
+    echo "Content-Transfer-Encoding: 8bit"
+    echo ""
+    cat "$TMP_HTML"
+    echo ""
+} > "$TMP_MIME"
+
+build_image_part "$AD_LOGO"    "ad_logo"
+build_image_part "$WAZUH_LOGO" "wazuh_logo"
+build_image_part "$MEDI1_LOGO" "medi1_logo"
+
+echo "--${BOUNDARY}--" >> "$TMP_MIME"
+
+/usr/sbin/ssmtp "$EMAIL_TO" < "$TMP_MIME"
+
+if [ $? -eq 0 ]; then
+    log "OK: email envoye a ${EMAIL_TO}"
+else
+    log "ERREUR: echec de l'envoi via ssmtp"
+fi
+
+rm -f "$TMP_HTML" "$TMP_MIME"
+exit 0

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>__EMAIL_TITLE__</title>
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; background: #f0f2f5; padding: 30px; color: #333; }
+  .email-container {
+    max-width: 640px; margin: 0 auto; background: #ffffff; border-radius: 6px;
+    overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+  }
+  .section-label {
+    background: #f7f7f7; border-top: 1px solid #ebebeb; border-bottom: 1px solid #ebebeb;
+    padding: 6px 20px; font-size: 10px; font-weight: bold; color: #888;
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .fields-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .fields-table tr { border-bottom: 1px solid #f0f0f0; }
+  .fields-table tr:last-child { border-bottom: none; }
+  .fields-table td { padding: 10px 20px; vertical-align: middle; }
+  .fields-table td.label { font-weight: bold; color: #444; width: 44%; font-size: 12px; }
+  .fields-table td.value { color: #555; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="email-container">
+
+  <!-- HEADER LOGOS + TITRE -->
+  <div style="background:#ffffff; border-bottom: 3px solid #8B0000; padding: 20px 24px 16px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; width:100%;">
+      <img src="cid:logo_wazuh" alt="Wazuh" style="height:52px; object-fit:contain;">
+      <img src="cid:logo_medi1" alt="Medi1tv" style="height:72px; object-fit:contain; margin-left:auto;">
+    </div>
+    <div style="background:#8B0000; border-radius:6px; padding:14px 20px;">
+      <div style="color:#ffffff; font-size:15px; font-weight:bold; margin-bottom:4px;">__EMAIL_TITLE__</div>
+      <div style="color:rgba(255,255,255,0.75); font-size:12px;">__INTRO_TEXT__</div>
+    </div>
+  </div>
+
+  <!-- SECTION : Détails de l'événement -->
+  <div class="section-label">Détails de l'événement</div>
+  <table class="fields-table">
+    <tr>
+      <td class="label">Protocole</td>
+      <td class="value">__PROTOCOL__</td>
+    </tr>
+    <tr>
+      <td class="label">Heure de détection</td>
+      <td class="value">__TRIGGER_TIME__</td>
+    </tr>
+    <tr>
+      <td class="label">Machine cible</td>
+      <td class="value">__TARGET_NAME__ : __TARGET_IP__</td>
+    </tr>
+    <tr>
+      <td class="label">Machine attaquante</td>
+      <td class="value">__SOURCE_DISPLAY__</td>
+    </tr>
+    <tr>
+      <td class="label">IP bloquée</td>
+      <td class="value">__SOURCE_IP__</td>
+    </tr>
+    <tr>
+      <td class="label">Utilisateur cible</td>
+      <td class="value">__TARGET_USER__</td>
+    </tr>
+    <tr>
+      <td class="label">Nombre de tentatives</td>
+      <td class="value">__ATTEMPT_COUNT__</td>
+    </tr>
+    <tr>
+      <td class="label">Timeout du blocage</td>
+      <td class="value">__TIMEOUT_DISPLAY__</td>
+    </tr>
+  </table>
+
+  <!-- SECTION : Analyse -->
+  <div class="section-label">Analyse</div>
+  <table class="fields-table">
+    <tr>
+      <td class="label">MITRE ATT&amp;CK</td>
+      <td class="value">__MITRE_DISPLAY__</td>
+    </tr>
+    <tr>
+      <td class="label">Statut</td>
+      <td class="value">__STATUS_TEXT__</td>
+    </tr>
+  </table>
+
+  <!-- FOOTER -->
+  <div style="background:#f8f8f8; border-top:1px solid #eeeeee; padding:12px 24px; text-align:center;">
+    <p style="font-size:11px; color:#aaaaaa; margin:0;">Notification generee automatiquement par Wazuh XDR</p>
+  </div>
+
+</div>
+</body>
+</html>
