@@ -1,0 +1,274 @@
+#!/bin/bash
+# =============================================================================
+# Script d'intégration Wazuh — Notification Email DCSync
+# Chemin    : /var/ossec/integrations/custom-dcsyn
+# VERSION CORRIGÉE : écriture précoce du Logon ID pour corrélation avec PtH
+# =============================================================================
+
+ALERT_FILE=$1
+LOG_FILE="/var/ossec/logs/integrations.log"
+TEMPLATE="/var/ossec/integrations/dcsyn_template.html"
+TMP_HTML="/tmp/dcsync_alert_$$.html"
+TMP_MIME="/tmp/dcsync_mime_$$.eml"
+EMAIL_TO="benalisafia99@gmail.com"
+RULE_ID="100900"
+
+LOGO_DIR="/var/ossec/integrations/logos"
+WAZUH_LOGO="${LOGO_DIR}/wazuh.png"
+AD_LOGO="${LOGO_DIR}/AD.png"
+MEDI1_LOGO="${LOGO_DIR}/Meditv.jpg"
+
+# Identifiants LDAP centralisés (voir /var/ossec/integrations/.ldap_creds)
+LDAP_CREDS_FILE="/var/ossec/integrations/.ldap_creds"
+LDAP_HOST="ldap://192.168.56.30"
+LDAP_BASE="DC=gstr,DC=local"
+
+BOUNDARY="WAZUH_MIME_BOUNDARY_$$"
+LOCK_FILE="/tmp/dcsync_email_lock"
+LOCK_TIMEOUT=120
+
+# =============================================================================
+# FONCTIONS
+# =============================================================================
+
+log() {
+    echo "$(date '+%Y/%m/%d %H:%M:%S') notify-dcsync-alert.sh: $1" >> "${LOG_FILE}"
+}
+
+extract() {
+    local FIELD=$1
+    python3 -c "
+import json, sys
+try:
+    d = json.loads(open('${ALERT_FILE}', encoding='utf-8', errors='replace').read())
+    keys = '${FIELD}'.split('.')
+    val = d
+    for k in keys:
+        val = val.get(k, {}) if isinstance(val, dict) else {}
+    print(val if val not in [{}, None, ''] else 'N/A')
+except Exception as e:
+    print('N/A')
+"
+}
+
+# Échappe les caractères spéciaux LDAP (RFC 4515) avant insertion dans un filtre
+ldap_escape() {
+    local s="$1"
+    s="${s//\\/\\5c}"
+    s="${s//\*/\\2a}"
+    s="${s//(/\\28}"
+    s="${s//)/\\29}"
+    s="${s//$'\x00'/\\00}"
+    echo "$s"
+}
+
+build_image_part() {
+    local FILE=$1
+    local CID=$2
+    local FILENAME
+    FILENAME=$(basename "$FILE")
+    local EXT="${FILENAME##*.}"
+    local MIME_TYPE="image/png"
+    case "${EXT,,}" in
+        jpg|jpeg) MIME_TYPE="image/jpeg" ;;
+        png)      MIME_TYPE="image/png"  ;;
+    esac
+    {
+        echo "--${BOUNDARY}"
+        echo "Content-Type: ${MIME_TYPE}; name=\"${FILENAME}\""
+        echo "Content-Transfer-Encoding: base64"
+        echo "Content-ID: <${CID}>"
+        echo "Content-Disposition: inline; filename=\"${FILENAME}\""
+        echo ""
+        base64 "$FILE"
+        echo ""
+    } >> "$TMP_MIME"
+}
+
+# =============================================================================
+# DEBUT DU SCRIPT
+# =============================================================================
+
+log "Script demarre, fichier: ${ALERT_FILE}"
+[ ! -f "$ALERT_FILE" ] && { log "ERREUR: fichier introuvable"; exit 1; }
+
+# Chargement des identifiants LDAP depuis un fichier séparé (chmod 600 root:wazuh)
+if [ -f "$LDAP_CREDS_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$LDAP_CREDS_FILE"
+else
+    log "ERREUR: fichier d'identifiants LDAP introuvable (${LDAP_CREDS_FILE})"
+    exit 1
+fi
+
+ALERT_RULE_ID=$(python3 -c "
+import json
+try:
+    d = json.loads(open('${ALERT_FILE}', encoding='utf-8', errors='replace').read())
+    print(str(d.get('rule', {}).get('id', '')))
+except:
+    print('')
+")
+
+log "Regle detectee: ${ALERT_RULE_ID}"
+
+if [ "$ALERT_RULE_ID" != "$RULE_ID" ]; then
+    log "Ignore: regle ${ALERT_RULE_ID} differente de ${RULE_ID}"
+    exit 0
+fi
+
+# =============================================================================
+# EXTRACTION PRECOCE (avant tout traitement lent) — pour corrélation avec PtH
+# =============================================================================
+
+SUBJECT_USER=$(extract "data.win.eventdata.subjectUserName")
+LOGON_ID=$(extract "data.win.eventdata.subjectLogonId")
+
+# Écrit IMMEDIATEMENT ces marqueurs, avant le LDAP (lent) et le HTML,
+# pour que le script custom-pth (qui attend quelques secondes) puisse
+# les lire au plus tôt et éviter le double email sur la même session.
+echo "$SUBJECT_USER" > /tmp/dcsync_user
+echo "$LOGON_ID" > /tmp/dcsync_logonid
+log "Marqueurs ecrits: user=${SUBJECT_USER} logonid=${LOGON_ID}"
+
+# Anti-doublon (propre au DCSync)
+if [ -f "$LOCK_FILE" ]; then
+    LOCK_AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE") ))
+    if [ "$LOCK_AGE" -lt "$LOCK_TIMEOUT" ]; then
+        log "Email supprime — doublon detecte (${LOCK_AGE}s < ${LOCK_TIMEOUT}s)"
+        exit 0
+    fi
+fi
+touch "$LOCK_FILE"
+
+# =============================================================================
+# EXTRACTION DES CHAMPS RESTANTS
+# =============================================================================
+
+TIMESTAMP_RAW=$(extract "timestamp")
+
+TIMESTAMP=$(python3 -c "
+import re
+from datetime import datetime, timezone, timedelta
+
+try:
+    ts = '${TIMESTAMP_RAW}'
+    ts = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts.replace('Z', '+00:00'))
+    dt = datetime.fromisoformat(ts)
+
+    local = dt.astimezone(timezone(timedelta(hours=1)))
+
+    print(local.strftime('%Y-%m-%d %H:%M:%S'))
+except Exception as e:
+    print('${TIMESTAMP_RAW}')
+")
+
+RULE_LEVEL=$(extract "rule.level")
+EVENT_ID=$(extract "data.win.system.eventID")
+COMPUTER=$(extract "data.win.system.computer")
+RECORD_ID=$(extract "data.win.system.eventRecordID")
+OBJECT_NAME=$(extract "data.win.eventdata.objectName")
+DOMAIN="GSTR.LOCAL"
+
+log "Alerte DCSync: ${SUBJECT_USER}@${DOMAIN} sur ${COMPUTER}"
+
+# =============================================================================
+# ENRICHISSEMENT LDAP
+# =============================================================================
+
+SAFE_SUBJECT_USER=$(ldap_escape "$SUBJECT_USER")
+
+LDAP_RESULT=$(ldapsearch \
+    -x -LLL -o ldif-wrap=no \
+    -H "$LDAP_HOST" \
+    -D "$LDAP_BIND_DN" \
+    -w "$LDAP_BIND_PW" \
+    -b "$LDAP_BASE" \
+    "(sAMAccountName=${SAFE_SUBJECT_USER})" \
+    memberOf lastLogon 2>>"$LOG_FILE")
+
+[ -z "$LDAP_RESULT" ] && log "ATTENTION: ldapsearch vide pour ${SUBJECT_USER}"
+
+# Gestion des attributs base64 (memberOf:: ...) ET texte clair (memberOf: ...)
+MEMBER_OF=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^memberOf::\ (.+) ]]; then
+        VAL=$(echo "${BASH_REMATCH[1]}" | tr -d ' ' | base64 -d 2>/dev/null)
+    elif [[ "$line" =~ ^memberOf:\ (.+) ]]; then
+        VAL="${BASH_REMATCH[1]}"
+    else
+        continue
+    fi
+    [ -n "$MEMBER_OF" ] && MEMBER_OF="${MEMBER_OF} | "
+    MEMBER_OF="${MEMBER_OF}${VAL}"
+done <<< "$LDAP_RESULT"
+[ -z "$MEMBER_OF" ] && MEMBER_OF="Aucun groupe secondaire"
+
+LAST_LOGON_RAW=$(echo "$LDAP_RESULT" | grep "^lastLogon:" | awk '{print $2}')
+if [ -z "$LAST_LOGON_RAW" ] || [ "$LAST_LOGON_RAW" = "0" ]; then
+    LAST_LOGON="Jamais connecte"
+else
+    LOGON_TS=$(( LAST_LOGON_RAW / 10000000 - 11644473600 ))
+    LAST_LOGON=$(date -d "@${LOGON_TS}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)
+    [ -z "$LAST_LOGON" ] && LAST_LOGON="N/A"
+fi
+
+# =============================================================================
+# GÉNÉRATION DU HTML
+# =============================================================================
+
+[ ! -f "$TEMPLATE" ] && { log "ERREUR: template introuvable ${TEMPLATE}"; exit 1; }
+for LOGO in "$WAZUH_LOGO" "$AD_LOGO" "$MEDI1_LOGO"; do
+    [ ! -f "$LOGO" ] && { log "ERREUR: logo introuvable ${LOGO}"; exit 1; }
+done
+
+sed \
+    -e "s|{{TIMESTAMP}}|${TIMESTAMP}|g" \
+    -e "s|{{EVENT_ID}}|${EVENT_ID}|g" \
+    -e "s|{{COMPUTER}}|${COMPUTER}|g" \
+    -e "s|{{DOMAIN}}|${DOMAIN}|g" \
+    -e "s|{{SUBJECT_USER}}|${SUBJECT_USER}|g" \
+    -e "s|{{LOGON_ID}}|${LOGON_ID}|g" \
+    -e "s|{{OBJECT_NAME}}|${OBJECT_NAME}|g" \
+    -e "s|{{MEMBER_OF}}|${MEMBER_OF}|g" \
+    -e "s|{{LAST_LOGON}}|${LAST_LOGON}|g" \
+    -e "s|{{RULE_ID}}|${ALERT_RULE_ID}|g" \
+    -e "s|{{RULE_LEVEL}}|${RULE_LEVEL}|g" \
+    -e "s|{{RECORD_ID}}|${RECORD_ID}|g" \
+    "$TEMPLATE" > "$TMP_HTML"
+
+# =============================================================================
+# CONSTRUCTION MIME ET ENVOI
+# =============================================================================
+
+{
+    echo "From: wazuh@gstr.local"
+    echo "To: ${EMAIL_TO}"
+    echo "Subject: [Wazuh] CRITIQUE — DCSync Detecte - ${SUBJECT_USER}@${DOMAIN} sur ${COMPUTER}"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: multipart/related; boundary=\"${BOUNDARY}\""
+    echo ""
+    echo "--${BOUNDARY}"
+    echo "Content-Type: text/html; charset=UTF-8"
+    echo "Content-Transfer-Encoding: 8bit"
+    echo ""
+    cat "$TMP_HTML"
+    echo ""
+} > "$TMP_MIME"
+
+build_image_part "$WAZUH_LOGO" "wazuh_logo"
+build_image_part "$AD_LOGO"    "ad_logo"
+build_image_part "$MEDI1_LOGO" "medi1_logo"
+
+echo "--${BOUNDARY}--" >> "$TMP_MIME"
+
+/usr/sbin/ssmtp "$EMAIL_TO" < "$TMP_MIME"
+
+if [ $? -eq 0 ]; then
+    log "OK: email envoye a ${EMAIL_TO}"
+else
+    log "ERREUR: echec de l'envoi via ssmtp"
+fi
+
+rm -f "$TMP_HTML" "$TMP_MIME"
+exit 0
